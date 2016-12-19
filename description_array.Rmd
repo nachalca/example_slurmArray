@@ -1,0 +1,119 @@
+---
+title: "array example"
+output: html_document
+---
+
+Here we adapt the [basic example](https://github.com/wlandau/remakeGenerator/blob/master/vignettes/remakeGenerator.Rmd) of ```remakeGenerator``` package (ecxept the report generation) to run it using SLURM ARRAY functionalyty.  The main idea is to split the whole simulation sttudy in similar jobs that will correspond to the array index. 
+
+### Run the workflow
+
+1. Produce inputs
+```{r, eval=FALSE}
+R CMD BATCH workflow_array.R 
+```
+
+2. Run all jobs
+```{r, eval=FALSE}
+sbatch --array=0-5%2 workflow_array_script.sh
+```
+
+The prevous line run 6 jobs (with indices from 0 to 5) sending 2 jobs simultaneouslly to slurm queue manager. We need 6 jobs since the simulation expample has create 6 datasets, 
+
+```{r, eval=FALSE}
+> datasets
+          target                 command
+1  normal16_rep1  normal_dataset(n = 16)
+2  normal16_rep2  normal_dataset(n = 16)
+3 poisson32_rep1 poisson_dataset(n = 32)
+4 poisson32_rep2 poisson_dataset(n = 32)
+5 poisson64_rep1 poisson_dataset(n = 64)
+6 poisson64_rep2 poisson_dataset(n = 64)
+```
+   
+   
+There are 4 files in the workflow:   
+
+* ``` code.R```: R functions used in the simulation study. (same as the [basic example](https://github.com/wlandau/remakeGenerator/blob/master/vignettes/remakeGenerator.Rmd) ) 
+* ``` workflow_array.R```: uses ```remakeGenerator``` to creat commands of datasets,analyses and summaries.  (same as the [basic example](https://github.com/wlandau/remakeGenerator/blob/master/vignettes/remakeGenerator.Rmd) ) 
+* ```workflow_array_job.R```: The instruccions corresponding to a simulation of one dataset and all analyses and summaries using that particular dataset. 
+* ```workflow_array_script.sh```: The scrip to slurm. 
+
+### Closer look to ```workflow_array_job.R```
+
+**First block**    
+Corresponds to setting up the needed inputs and the array index. The file ```targets.Rdata``` is produced by ```workflow_array.R```
+```{r, eval=FALSE}
+# i = identify the scenario 
+ss  = Sys.getenv("SLURM_ARRAY_TASK_ID") 
+i = as.numeric(ss) + 1
+
+# 0 ) libraries and functions
+pkgs <- c('plyr', 'dplyr', 'tidyr', 'ggplot2')
+lapply(pkgs, library,  character.only = TRUE, quietly=TRUE )
+
+# inputs
+load('targets.Rdata')
+source('code.R')
+```
+
+**Second block.**    
+We use the index "i" to indicate ```datasets[i,]```, we simulate the dataset, run the analyses that use it and compute the summaries of the analyses. In this way, the entire simulation is divided in jobs of similar dificulty. This block will be the same for every simulation study (I think). 
+
+```{r, eval=FALSE}
+# 1) Create a dataset, run the analysis and its summary
+# 1.1 Create data set and save it
+eval( parse(text= paste(datasets$target[i], datasets$command[i], sep=' <- ')  ) )
+saveRDS(get(datasets$target[i]) , file = paste('datasets/', datasets$target[i], '.rds', sep='') )
+
+# 1.2 Run all analyses that use this dataset
+as <- grep(datasets$target[i], analyses$target) 
+for (j in as) {
+  eval( parse(text= paste(analyses$target[j], analyses$command[j], sep=' <- ')  ) )
+  saveRDS(get(analyses$target[j]), file = paste('analyses/', analyses$target[j], '.rds', sep='') )
+}
+
+# 1.2 Run all summaries that use this dataset
+sm <- grep(datasets$target[i], summaries$target) 
+for (j in sm) {
+  eval( parse(text= paste(summaries$target[j], summaries$command[j], sep=' <- ')  ) )
+  saveRDS(get(summaries$target[j]) , file = paste('summaries/', summaries$target[j], '.rds', sep='') )
+}
+```
+
+**Third block**   
+After all summaries are done, we collect them and produce outputs, plots, etc. 
+There is an (unsolved) issue here, that is how to determine all summaries are done ok. For now, I coded so the plots are produced in the last job in the array. As every job has similar size this should be ok, but it would be better if I can tell slurm not to start the last job until the previous are finish. 
+
+```{r, eval=FALSE}
+#2) Collect summaries and dataests to produce results
+# when i == length(datasets$target) + 1 everithing is done 
+#is this true though?? how can I check all jobs are finished ?
+if (i < length(datasets$target) ) {
+  rm(list = ls())
+} else {
+  rm(list = ls() )
+  # 2.1 gather summaries
+  ll.res <- list.files('summaries')
+  rr <- list()
+  for( k in 1:length(ll.res)) {
+    rr[[k]] <- readRDS( paste('summaries/', ll.res[k], sep='') )
+  }
+  names(rr) <- gsub('.rds', '', ll.res)
+  mse <- bind_rows(rr[grep('mse', ll.res)], .id = "info")
+  coefs <- bind_rows(rr[grep('coef', ll.res)], .id = "info")
+  rm(rr, k)
+  
+  mse <- mse %>%  separate(info, sep='_', into =c('x1', 'an', 'dts', 'rep') ) %>% dplyr::select(-x1)
+  
+  coefs <- coefs %>% separate(info, sep='_', into =c('x1', 'an', 'dts', 'rep') ) %>% dplyr::select(-x1)
+    p <- mse %>% ggplot() + geom_jitter(aes(y=mse, x=dts, color=an), height=0)
+  
+  # Outputs
+  save(mse, coefs, file='output/output.Rdata')
+  write.csv(coefs, file='output/coefs.csv')
+  
+  pdf('output/mse.pdf') 
+  print(p)
+  dev.off()
+}
+```
